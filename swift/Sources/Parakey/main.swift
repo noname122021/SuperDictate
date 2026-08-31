@@ -17647,6 +17647,8 @@ private enum ParakeySelfTest {
             return runSuite("recording-lifecycle", testRecordingLifecycle)
         case "power-state":
             return runSuite("power-state", testPowerStateRecoveryDecision)
+        case "asr-reliability":
+            return runSuite("asr-reliability", testASRReliability)
         case "model-integrity":
             return runSuite("model-integrity", testModelIntegrity)
         case "update":
@@ -17700,6 +17702,7 @@ private enum ParakeySelfTest {
         try testAudioRouteChangeDecision()
         try testRecordingLifecycle()
         try testPowerStateRecoveryDecision()
+        try testASRReliability()
         try testModelIntegrity()
         try testUpdate()
         try testHostileRegistryEnvDetection()
@@ -21539,6 +21542,149 @@ private enum ParakeySelfTest {
             equals: false,
             "configuration changes at the suppression deadline should be handled normally"
         )
+    }
+
+    /// Exact production shape of the macOS 14.x E5RT timeout from
+    /// ~/Library/Logs/SuperDictate.log: nested two NSError levels deep.
+    private static func makeNeuralEngineTimeoutError() -> NSError {
+        let inner = NSError(
+            domain: "com.apple.CoreML",
+            code: 0,
+            userInfo: [
+                NSLocalizedDescriptionKey: "E5RT: Submit Async failed for [10:1]: Async task: Encoder_main__Op8_Cast has timed out. @ CancelTimedOutAsyncTask_block_invoke (10)"
+            ]
+        )
+        return NSError(
+            domain: "com.apple.CoreML",
+            code: 0,
+            userInfo: [
+                NSLocalizedDescriptionKey: "Unable to compute the asynchronous prediction using ML Program. It can be an invalid input data or broken/unsupported model.",
+                NSUnderlyingErrorKey: inner
+            ]
+        )
+    }
+
+    private static func testASRReliability() throws {
+        try expect(isNeuralEngineTimeoutError(makeNeuralEngineTimeoutError()),
+                   equals: true,
+                   "CoreML E5RT async-submit timeout should be recognized")
+        try expect(isNeuralEngineTimeoutError(NSError(domain: "com.apple.CoreML", code: 0)),
+                   equals: false,
+                   "plain CoreML errors without the E5RT timeout marker should not be treated as engine timeouts")
+        try expect(isNeuralEngineTimeoutError(NSError(domain: "Parakey", code: -2)),
+                   equals: false,
+                   "unloaded-engine errors are not neural engine timeouts")
+        try expect(isNeuralEngineTimeoutError(ASRError.invalidAudioData),
+                   equals: false,
+                   "invalid audio data is not a neural engine timeout")
+
+        try expect(TranscriptionWorker.shouldRetryTranscription(after: makeNeuralEngineTimeoutError()),
+                   equals: true,
+                   "E5RT timeouts should be retried after a warm-up")
+        try expect(TranscriptionWorker.shouldRetryTranscription(after: NSError(domain: "Parakey", code: -2)),
+                   equals: false,
+                   "unloaded-engine errors should not be retried")
+        try expect(TranscriptionWorker.shouldRetryTranscription(after: NSError(domain: "Parakey", code: -3)),
+                   equals: false,
+                   "reentrancy refusals should not be retried")
+        try expect(TranscriptionWorker.shouldRetryTranscription(after: ASRError.invalidAudioData),
+                   equals: false,
+                   "sub-minimum clips fail identically on retry and should not be retried")
+
+        // The watchdog must bound hard ANE hangs while never cutting off a
+        // legitimately long dictation: real ASR runs at ~100× realtime.
+        try expect(transcriptionWatchdogSeconds(audioDuration: 0),
+                   equals: 45,
+                   "watchdog floor should keep even tiny dictations recoverable")
+        try expect(transcriptionWatchdogSeconds(audioDuration: 41.5),
+                   equals: 71.5,
+                   "watchdog should track audio duration above the floor")
+        try expect(transcriptionWatchdogSeconds(audioDuration: 1_200),
+                   equals: 1_230,
+                   "watchdog should scale for max-length dictations")
+
+        // Live-transcription fallback heuristic: no text for ≥1 s of audio
+        // means the streaming path lost the utterance — batch retry needed.
+        try expect(liveTranscriptionResultIsUsable("привет", audioDuration: 5),
+                   equals: true,
+                   "non-empty streaming text is usable")
+        try expect(liveTranscriptionResultIsUsable("", audioDuration: 5),
+                   equals: false,
+                   "empty text for long audio must fall back to batch")
+        try expect(liveTranscriptionResultIsUsable("  \n ", audioDuration: 5),
+                   equals: false,
+                   "whitespace-only streaming text counts as empty")
+        try expect(liveTranscriptionResultIsUsable("", audioDuration: 0.5),
+                   equals: true,
+                   "short clips may legitimately be silence")
+
+        // Interim drafts are punctuation-free: per-chunk decoding sprays
+        // sentence enders, and the batch final restores real punctuation.
+        try expect(interimTypingText(joinedLiveTranscript(confirmed: "Привет. Как",
+                                                          volatile: "дела. Сегодня")),
+                   equals: "Привет Как дела Сегодня",
+                   "joined two-tier interim text drops sentence-ending punctuation")
+        try expect(interimTypingText("Привет. Как дела. Сегодня"),
+                   equals: "Привет Как дела Сегодня",
+                   "interim typing text drops sentence-ending punctuation")
+        try expect(interimTypingText("  слово  слово\tслово  "),
+                   equals: "слово слово слово",
+                   "interim typing text collapses whitespace")
+        try expect(interimTypingText("Вопрос? Да! Вот…"),
+                   equals: "Вопрос Да Вот",
+                   "interim typing text strips ? ! and ellipsis")
+        try expect(interimTypingText("с запятой, и тире - ок"),
+                   equals: "с запятой, и тире - ок",
+                   "interim typing text keeps commas and dashes")
+
+        // Append-only in-field typing: only pure suffix growth may be typed
+        // incrementally; rewrites of already-inserted text must wait for the
+        // finalize-time span replacement.
+        try expect(liveAppendDelta(from: "при", to: "привет"),
+                   equals: "вет",
+                   "pure suffix growth yields the append delta")
+        try expect(liveAppendDelta(from: "привет", to: "привет"),
+                   equals: nil,
+                   "identical text yields no delta")
+        try expect(liveAppendDelta(from: "превет", to: "привет"),
+                   equals: nil,
+                   "rewrites of inserted text are not appendable")
+        try expect(liveAppendDelta(from: "привет мир", to: "привет"),
+                   equals: nil,
+                   "shrinking text is not appendable")
+        try expect(liveAppendDelta(from: "прив", to: "привет!"),
+                   equals: "ет!",
+                   "punctuation growth is appendable")
+
+        // Divergence point for tail-only rewrites: the head of the draft
+        // must stay untouched when the hypothesis revises recent words.
+        try expect(utf16CommonPrefixLength("привет как дела", "привет как оно"),
+                   equals: "привет как ".utf16.count,
+                   "common prefix stops at the first differing word")
+        try expect(utf16CommonPrefixLength("привет", "привет"),
+                   equals: "привет".utf16.count,
+                   "identical strings share their full length")
+        try expect(utf16CommonPrefixLength("привет", ""),
+                   equals: 0,
+                   "empty string shares no prefix")
+
+        // A clip that survives the discard check must clear the model's
+        // 300 ms minimum, otherwise it errors as invalidAudioData instead
+        // of being discarded silently.
+        try expect(MIN_CLIP_SECONDS * SAMPLE_RATE >= Double(ASR_MINIMUM_AUDIO_SAMPLES),
+                   equals: true,
+                   "clip discard threshold must stay above the model's 300 ms minimum")
+        try expect(ASR_MINIMUM_AUDIO_SAMPLES,
+                   equals: 4_800,
+                   "model audio minimum should remain 300 ms at 16 kHz")
+        try expect(recordingReleaseAction(capturedSampleCount: ASR_MINIMUM_AUDIO_SAMPLES - 1,
+                                          sampleRate: SAMPLE_RATE),
+                   equals: .discardTooShort(duration: Double(ASR_MINIMUM_AUDIO_SAMPLES - 1) / SAMPLE_RATE),
+                   "clips just under the model minimum should be discarded silently")
+        try expect(recordingReleaseAction(capturedSampleCount: Int(MIN_CLIP_SECONDS * SAMPLE_RATE),
+                                          sampleRate: SAMPLE_RATE),
+                   equals: .transcribe(duration: MIN_CLIP_SECONDS),
+                   "clips at the discard threshold should be transcribed")
     }
 
     private static func testRecordingLifecycle() throws {
