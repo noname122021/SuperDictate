@@ -54,7 +54,14 @@ let FN_KEYCODE: CGKeyCode = 63
 let ESCAPE_KEYCODE: CGKeyCode = 53
 let RETURN_KEYCODE: CGKeyCode = 36
 let ENTER_AFTER_INSERT_DELAY_NANOSECONDS: UInt64 = 120_000_000
-let MIN_CLIP_SECONDS: Double = 0.25
+// FluidAudio's Parakeet models reject audio under 300 ms of 16 kHz samples
+// with ASRError.invalidAudioData. The discard threshold and the recovery
+// sweep both key off this minimum so sub-minimum clips never reach the
+// model (and never linger in the pending-dictation journal).
+let ASR_MINIMUM_AUDIO_SAMPLES = 4_800
+// Kept above the model minimum: clips between the two thresholds used to
+// pass the discard check, fail transcription, and flash a dictation error.
+let MIN_CLIP_SECONDS: Double = 0.32
 let UPDATE_CHECK_FIRST_DELAY_SECONDS: TimeInterval = 30
 let UPDATE_CHECK_INTERVAL_SECONDS: TimeInterval = 6 * 3600  // 6h
 let UPDATE_REMIND_LATER_SECONDS: TimeInterval = 24 * 3600  // 24h
@@ -11099,6 +11106,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     PendingDictationRecovery.remove(url)
                     continue
                 }
+                guard samples.count >= ASR_MINIMUM_AUDIO_SAMPLES else {
+                    // Sub-minimum clips can never transcribe; keeping them
+                    // would re-queue them at every startup forever.
+                    PendingDictationRecovery.remove(url)
+                    log("pending dictation recovery: discarded clip shorter than the model minimum (\(samples.count) samples)")
+                    continue
+                }
                 let duration = Double(samples.count) / SAMPLE_RATE
                 let requestedAt = ProcessInfo.processInfo.systemUptime
                 let transcription = try await asr.transcribe(
@@ -11443,6 +11457,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 isCoreRuntimeReady = true
                 startupStatusTitle = "Finishing setup…"
                 completeReadinessIfPossible(reason: reason)
+                schedulePostWakeNeuralEngineWarmUp()
             } catch {
                 guard !isTerminating else { return }
                 recordStartupFailure(stage: .audioInput, error: error, reason: reason)
@@ -12523,7 +12538,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let taskStartedAt = ProcessInfo.processInfo.systemUptime
             var dictationFailed = false
             do {
-                let completed = try await transcriptionTask.value
+                let completed = try await awaitWithTranscriptionWatchdog(
+                    transcriptionTask,
+                    audioDuration: dur
+                )
                 let transcription = completed.transcription
                 let asrTiming = transcription.timing(
                     totalSeconds: completed.completedAt - asrRequestedAt
