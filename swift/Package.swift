@@ -25,10 +25,16 @@ let package = Package(
                  revision: "313feb4bd692780a9a5b5fa9048fdb119486dde8"),
     ],
     targets: [
+        .target(
+            name: "ParakeySupport",
+            path: "Sources/ParakeySupport",
+            publicHeadersPath: "include"
+        ),
         .executableTarget(
             name: "Parakey",
             dependencies: [
                 .product(name: "FluidAudio", package: "FluidAudio"),
+                "ParakeySupport",
             ]
             // No `resources:` here on purpose. SwiftPM bundles them as
             // a `<Package>_<Target>.bundle` directory next to the

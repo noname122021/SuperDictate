@@ -31,6 +31,7 @@ import CryptoKit
 import Darwin
 import ApplicationServices
 import FluidAudio
+import ParakeySupport
 import IOKit
 import QuartzCore
 import Security
@@ -7908,12 +7909,15 @@ struct AppMemoryUsage {
     let physicalFootprintBytes: UInt64
 }
 
+// CommandLineTools' Swift 6.0 toolchain imports the SDK's mach_task_self_
+// without the unsafe annotation newer Xcode toolchains carry; the C shim in
+// ParakeySupport keeps this compiling everywhere.
 func currentAppMemoryUsage() -> AppMemoryUsage? {
     var info = task_vm_info_data_t()
     var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.stride / MemoryLayout<natural_t>.stride)
     let result = withUnsafeMutablePointer(to: &info) { pointer in
         pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { rebound in
-            task_info(mach_task_self_,
+            task_info(parakey_current_task_port(),
                       task_flavor_t(TASK_VM_INFO),
                       rebound,
                       &count)
@@ -13508,7 +13512,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             value: formattedUsageSeconds(snapshot.averageASRSeconds),
                             detail: "в среднем"),
         ]
-        metricCards.forEach(metrics.addArrangedSubview)
+        // Explicit closure: Swift 6.0's CommandLineTools toolchain mis-types
+        // the partially-applied ObjC selector as throwing.
+        metricCards.forEach { metrics.addArrangedSubview($0) }
 
         let charts = NSStackView()
         charts.orientation = .horizontal

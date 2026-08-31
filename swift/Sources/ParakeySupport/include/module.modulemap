@@ -1,0 +1,4 @@
+module ParakeySupport {
+    header "ParakeySupport.h"
+    export *
+}
