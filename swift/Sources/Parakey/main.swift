@@ -2616,6 +2616,7 @@ final class Settings: @unchecked Sendable {
     private static let keyDailyDictationUsage = "daily_dictation_usage_v1"
     private static let keyDidImportDictationUsageLog = "did_import_dictation_usage_log_v1"
     private static let keyShowRecordingWaveform = "show_recording_waveform"
+    private static let keyLiveDictation = "live_dictation_enabled"
     private static let keyRecordingHUDRecordingColor = "recording_hud_recording_color"
     private static let keyRecordingHUDTranscribingColor = "recording_hud_transcribing_color"
     private static let keyRecordingHUDBackgroundStyle = "recording_hud_background_style"
@@ -2951,6 +2952,19 @@ final class Settings: @unchecked Sendable {
             return true
         }
         set { defaults.set(newValue, forKey: Self.keyShowRecordingWaveform) }
+    }
+
+    /// Live (streaming) transcription shown under the recording HUD while
+    /// speaking. The final inserted text still comes from the streaming
+    /// session's finish(), with the batch path as automatic fallback.
+    var liveDictationEnabled: Bool {
+        get {
+            if defaults.object(forKey: Self.keyLiveDictation) != nil {
+                return defaults.bool(forKey: Self.keyLiveDictation)
+            }
+            return true
+        }
+        set { defaults.set(newValue, forKey: Self.keyLiveDictation) }
     }
 
     var recordingHUDRecordingColor: RecordingHUDAccentColor {
@@ -4978,6 +4992,12 @@ final class AudioCapture: @unchecked Sendable {
     private var converter: AVAudioConverter?
     private var converterInputFormat: AVAudioFormat?
     private var manuallyMixInputToMono = false
+    /// Live-transcription feed. Receives the converted 16 kHz mono buffer for
+    /// every accepted tap callback. Assigned/cleared by the owner around the
+    /// recording lifecycle; read on the render thread — treat it as
+    /// write-rare, read-hot and keep the closure trivial (a hop into an
+    /// actor queue, nothing else).
+    var onConvertedBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)?
     private let lock = NSLock()
     private var samples = AudioSampleAccumulator()
     private var _isRunning = false
@@ -5316,13 +5336,20 @@ final class AudioCapture: @unchecked Sendable {
         // already have started. The generation token keeps straggler
         // frames out of the next clip.
         lock.lock()
-        if _isRunning && recordingGeneration == generation {
+        let accepted = _isRunning && recordingGeneration == generation
+        if accepted {
             samples.append(arr)
             recoveryJournal?.append(arr)
             latestLevel = level
             latestLevelSequence &+= 1
         }
         lock.unlock()
+        // Live-transcription feed: same acceptance rule as the sample
+        // accumulator, and invoked off the lock so the consumer's own
+        // locking never blocks the render thread.
+        if accepted {
+            onConvertedBuffer?(out)
+        }
     }
 
     private func converterSourceFormat(for inputFormat: AVAudioFormat) -> AVAudioFormat {
@@ -5477,6 +5504,124 @@ private enum LoadedSpeechEngine {
     case parakeetV3(AsrManager)
 }
 
+/// Matches the macOS 14.x Neural Engine (E5RT) async-submit timeout CoreML
+/// surfaces as a nested NSError chain: "E5RT: Submit Async failed … has
+/// timed out". Observed when the engine goes cold after system sleep or a
+/// long idle period; the retry path in TranscriptionWorker.transcribe keys
+/// off this to re-warm the engine before re-running the dictation.
+func isNeuralEngineTimeoutError(_ error: Error) -> Bool {
+    var current: Error? = error
+    var depth = 0
+    while depth < 8, let level = current {
+        let description = (level as NSError).localizedDescription
+        if description.contains("E5RT"), description.contains("has timed out") {
+            return true
+        }
+        current = (level as NSError).userInfo[NSUnderlyingErrorKey] as? Error
+        depth += 1
+    }
+    return false
+}
+
+struct TranscriptionWatchdogTimeout: Error {}
+
+/// Length in UTF-16 code units of the longest common prefix of two strings
+/// — the divergence point used to rewrite only the changed tail of the
+/// in-field draft instead of the whole span.
+func utf16CommonPrefixLength(_ a: String, _ b: String) -> Int {
+    let aUnits = Array(a.utf16)
+    let bUnits = Array(b.utf16)
+    var index = 0
+    while index < aUnits.count, index < bUnits.count, aUnits[index] == bUnits[index] {
+        index += 1
+    }
+    return index
+}
+
+/// A finished live session that produced no text for ≥1 s of audio is
+/// treated as a failure and falls back to the batch path: the model's
+/// minimum input is 0.3 s, so real speech yields something. Shorter clips
+/// may legitimately be silence.
+func liveTranscriptionResultIsUsable(_ text: String, audioDuration: Double) -> Bool {
+    if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
+    return audioDuration < 1.0
+}
+
+/// Both streaming tiers collapsed into one growing string for in-field
+/// typing: the append-only confirmed part, then the still-changing volatile
+/// tail (the injector corrects the tail in place at its divergence point).
+func joinedLiveTranscript(confirmed: String, volatile: String) -> String {
+    guard !confirmed.isEmpty, !volatile.isEmpty else {
+        return confirmed.isEmpty ? volatile : confirmed
+    }
+    return confirmed + " " + volatile
+}
+
+/// Interim in-field text is a throwaway draft — the batch final replaces
+/// it with properly punctuated text on release. Per-chunk decoding sprays
+/// sentence-ending punctuation after roughly every second of speech
+/// ("слово. слово. слово."), so sentence enders are stripped and
+/// whitespace collapsed for everything typed before the final replace.
+func interimTypingText(_ text: String) -> String {
+    let withoutSentenceEnders = text.filter { character in
+        !".!?…".contains(character)
+    }
+    let collapsed = withoutSentenceEnders
+        .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+    return collapsed.trimmingCharacters(in: .whitespaces)
+}
+
+/// Append-only live typing delta: the suffix `to` adds beyond `from`, or
+/// nil when `to` rewrites earlier text (the volatile tail changed
+/// something already inserted). Comparison is UTF-16 code units, matching
+/// the AX text ranges used to track the inserted span.
+func liveAppendDelta(from inserted: String, to updated: String) -> String? {
+    let insertedUnits = Array(inserted.utf16)
+    let updatedUnits = Array(updated.utf16)
+    guard updatedUnits.count >= insertedUnits.count else { return nil }
+    for index in insertedUnits.indices where insertedUnits[index] != updatedUnits[index] {
+        return nil
+    }
+    let deltaUnits = updatedUnits[insertedUnits.count...]
+    guard !deltaUnits.isEmpty else { return nil }
+    return String(decoding: deltaUnits, as: UTF16.self)
+}
+
+/// Generous bound on a whole transcription (including the retry ladder):
+/// real ASR runs at ~100× realtime, so duration + 30 s leaves 30–100×
+/// headroom. The bound exists for the pathological case where a hard-stuck
+/// E5RT session makes CoreML's own timeout take minutes to fire (observed:
+/// 41 s of audio → 99 s before the first error surfaced, isBusy blocking
+/// new dictations the whole time).
+func transcriptionWatchdogSeconds(audioDuration: Double) -> Double {
+    max(45, audioDuration + 30)
+}
+
+/// Races the transcription task against the watchdog deadline. If the
+/// deadline fires first the thrown TranscriptionWatchdogTimeout cancels the
+/// group awaiter — the caller must still cancel the detached task itself
+/// (cancelling an awaiting task does not propagate to a detached one) and
+/// recover the engine.
+func awaitWithTranscriptionWatchdog<T: Sendable>(
+    _ task: Task<T, Error>,
+    audioDuration: Double
+) async throws -> T {
+    let deadlineNanoseconds = UInt64(transcriptionWatchdogSeconds(audioDuration: audioDuration)
+                                     * 1_000_000_000)
+    return try await withThrowingTaskGroup(of: T.self) { group in
+        group.addTask { try await task.value }
+        group.addTask {
+            try await Task.sleep(nanoseconds: deadlineNanoseconds)
+            throw TranscriptionWatchdogTimeout()
+        }
+        defer { group.cancelAll() }
+        guard let first = try await group.next() else {
+            throw TranscriptionWatchdogTimeout()
+        }
+        return first
+    }
+}
+
 private struct TranscriptionWorkerResult: Sendable {
     let text: String
     let workerQueueSeconds: Double
@@ -5503,10 +5648,21 @@ private struct CompletedTranscriptionWorkerResult: Sendable {
 actor TranscriptionWorker {
     private var engine: LoadedSpeechEngine?
     private var loadedProfile: SpeechModelProfile?
+    /// Retained so streaming sessions can share the already-verified v3
+    /// models without a second load pass.
+    private var loadedModels: AsrModels?
     private(set) var ready = false
+    /// Active live-transcription session, if any. While it exists the batch
+    /// path refuses work — the ANE gets one consumer at a time.
+    private var activeStreamingSession: SlidingWindowAsrManager?
     /// Reentrancy backstop — see the comment above. True for the full
-    /// duration of transcribe(), including across its await.
-    private var inFlight = false
+    /// duration of transcribeOnce(), including across its await. Kept as a
+    /// monotonic attempt id rather than a bool: when the watchdog or the
+    /// retry ladder discards a hung attempt and reloads the engine, the
+    /// zombie's deferred cleanup must not clear the flag of whichever
+    /// attempt is current by then.
+    private var attemptCounter = 0
+    private var activeAttempt: Int?
 
     func load(profile requestedProfile: SpeechModelProfile,
               progressHandler: DownloadUtils.ProgressHandler? = nil) async throws {
@@ -5554,21 +5710,137 @@ actor TranscriptionWorker {
         let models = try await AsrModels.load(from: modelDirectory,
                                               version: .v3,
                                               progressHandler: progressHandler)
-        return AsrManager(config: .default, models: models)
+        // Chunks run sequentially. Concurrent E5RT submits against a cold or
+        // hung Neural Engine stretch one failure into a group-wide stall:
+        // with 4 parallel workers a 41 s dictation took 99 s for the first
+        // timeout to surface. A serial pass costs well under a second extra
+        // at ~100× realtime and fails fast on the first chunk instead.
+        let sequentialConfig = ASRConfig(parallelChunkConcurrency: 1)
+        loadedModels = models
+        return AsrManager(config: sequentialConfig, models: models)
+    }
+
+    /// Creates and starts a live-transcription session sharing the loaded,
+    /// verified v3 models. Feed converted mic buffers via `streamAudio()`,
+    /// consume `transcriptionUpdates` for partial text, call `finish()` on
+    /// release (or `cancel()` when the dictation is abandoned).
+    func makeStreamingSession() async throws -> SlidingWindowAsrManager {
+        guard ready, let models = loadedModels else {
+            throw NSError(domain: "Parakey", code: -2)
+        }
+        guard activeAttempt == nil, activeStreamingSession == nil else {
+            log("ASR: live session refused — transcription already in flight")
+            throw NSError(domain: "Parakey", code: -3)
+        }
+        // Windowed streaming on a fixed-input batch model: the window must
+        // fit the model's 15 s limit. A 2+1+1 s window gives the first
+        // caption after ~2 s of speech; right context is trimmed to 1 s
+        // because the interim draft is throwaway — the batch final replaces
+        // it wholesale, so per-chunk accuracy barely matters. Confirmation
+        // starts at 1 s of context with a low threshold, and BOTH tiers are
+        // typed: confirmed grows append-only, while the volatile tail is
+        // corrected in place by the injector's divergence-point tail
+        // rewrite — that also keeps the last spoken words appearing ~1–2 s
+        // after speech instead of waiting for the finalize replace.
+        let liveConfig = SlidingWindowAsrConfig(
+            chunkSeconds: 1.0,
+            hypothesisChunkSeconds: 1.0,
+            leftContextSeconds: 2.0,
+            rightContextSeconds: 1.0,
+            minContextForConfirmation: 1.0,
+            confirmationThreshold: 0.45
+        )
+        let session = SlidingWindowAsrManager(config: liveConfig)
+        try await session.loadModels(models)
+        try await session.startStreaming()
+        activeStreamingSession = session
+        log("ASR: live transcription session started")
+        return session
+    }
+
+    /// Releases the worker's live-session slot. The caller owns calling
+    /// finish()/cancel() on the session first; this only re-opens the batch
+    /// path.
+    func endStreamingSession() {
+        guard activeStreamingSession != nil else { return }
+        activeStreamingSession = nil
+        log("ASR: live transcription session ended")
     }
 
     fileprivate func transcribe(samples: [Float],
                                language: Language? = nil,
                                requestedAt: TimeInterval) async throws -> TranscriptionWorkerResult {
+        guard activeStreamingSession == nil else {
+            log("ASR: batch transcribe refused while a live session is active")
+            throw NSError(domain: "Parakey", code: -3)
+        }
+        do {
+            return try await transcribeOnce(samples: samples,
+                                            language: language,
+                                            requestedAt: requestedAt)
+        } catch {
+            guard !Task.isCancelled, Self.shouldRetryTranscription(after: error) else { throw error }
+            let neuralEngineTimeout = isNeuralEngineTimeoutError(error)
+            log("ASR: transcription attempt 1 failed (\(error.localizedDescription)); "
+                + (neuralEngineTimeout ? "neural engine timed out, re-warming and retrying once"
+                                       : "retrying once"))
+            if neuralEngineTimeout {
+                // On macOS 14.x the first CoreML inference against the cold
+                // Neural Engine fails with an E5RT async-submit timeout while
+                // an immediate second attempt often hits the same timeout. A
+                // 0.4 s silence inference brings the engine back so the retry
+                // of the real dictation can succeed. If the warm-up itself
+                // fails, the E5RT session is hard-stuck: only tearing the
+                // compiled program down clears it, so reload right away.
+                do {
+                    try await warmUp()
+                } catch {
+                    log("ASR: warm-up also failed (\(error.localizedDescription)); engine hard-stuck, reloading speech engine")
+                    await recoverAfterHungTranscription()
+                }
+            }
+            do {
+                return try await transcribeOnce(samples: samples,
+                                                language: language,
+                                                requestedAt: requestedAt)
+            } catch {
+                guard !Task.isCancelled, Self.shouldRetryTranscription(after: error) else { throw error }
+                log("ASR: transcription attempt 2 failed (\(error.localizedDescription)); reloading speech engine for final attempt")
+                await recoverAfterHungTranscription()
+                return try await transcribeOnce(samples: samples,
+                                                language: language,
+                                                requestedAt: requestedAt)
+            }
+        }
+    }
+
+    /// Errors that would fail identically on a second attempt must not burn
+    /// one: the engine being unloaded, the reentrancy refusal, and clips
+    /// shorter than the model's 300 ms minimum are deterministic failures.
+    static func shouldRetryTranscription(after error: Error) -> Bool {
+        if let ns = error as NSError?, ns.domain == "Parakey" {
+            return ns.code != -2 && ns.code != -3
+        }
+        if case ASRError.invalidAudioData = error { return false }
+        return true
+    }
+
+    private func transcribeOnce(samples: [Float],
+                                language: Language? = nil,
+                                requestedAt: TimeInterval) async throws -> TranscriptionWorkerResult {
         let workerEnteredAt = ProcessInfo.processInfo.systemUptime
         guard let engine else { throw NSError(domain: "Parakey", code: -2) }
-        guard !inFlight else {
+        guard activeAttempt == nil else {
             log("ASR: transcribe re-entered while another transcription is in flight — refusing (ParakeyApp.isBusy should make this impossible)")
             assertionFailure("TranscriptionWorker.transcribe re-entered across a suspension point")
             throw NSError(domain: "Parakey", code: -3)
         }
-        inFlight = true
-        defer { inFlight = false }
+        attemptCounter += 1
+        let attempt = attemptCounter
+        activeAttempt = attempt
+        defer {
+            if activeAttempt == attempt { activeAttempt = nil }
+        }
         switch engine {
         case .parakeetV3(let asr):
             let decoderPreparationStartedAt = ProcessInfo.processInfo.systemUptime
@@ -5586,10 +5858,36 @@ actor TranscriptionWorker {
         }
     }
 
+    /// Discards the loaded AsrManager and rebuilds it from the verified
+    /// local cache (~1–2 s warm). A hard-stuck E5RT session only clears when
+    /// the compiled program is torn down; re-submitting against it just
+    /// queues another multi-second timeout. Best-effort: a reload failure is
+    /// logged, the next transcribe surfaces the underlying engine error.
+    func recoverAfterHungTranscription() async {
+        if let session = activeStreamingSession {
+            await session.cancel()
+            activeStreamingSession = nil
+        }
+        guard let profile = loadedProfile else { return }
+        engine = nil
+        loadedProfile = nil
+        ready = false
+        activeAttempt = nil
+        do {
+            try await load(profile: profile)
+            log("ASR: speech engine reloaded after hung transcription")
+        } catch {
+            log("ASR: speech engine reload failed: \(error.localizedDescription)")
+        }
+    }
+
     func warmUp() async throws -> ASRTimingBreakdown {
         let samples = [Float](repeating: 0, count: Int(SAMPLE_RATE * 0.4))
         let requestedAt = ProcessInfo.processInfo.systemUptime
-        let transcription = try await transcribe(
+        // warmUp deliberately bypasses the retry wrapper: it is itself the
+        // recovery tool for cold-engine timeouts, and a failing warm-up must
+        // not recurse into another warm-up.
+        let transcription = try await transcribeOnce(
             samples: samples,
             language: nil,
             requestedAt: requestedAt
@@ -5599,8 +5897,13 @@ actor TranscriptionWorker {
     }
 
     func unload() async {
+        if let session = activeStreamingSession {
+            await session.cancel()
+            activeStreamingSession = nil
+        }
         engine = nil
         loadedProfile = nil
+        loadedModels = nil
         ready = false
         log("ASR: unloaded")
     }
@@ -10442,6 +10745,254 @@ private final class DictationSpeechTimeChartView: NSView {
     }
 }
 
+/// Types the growing live transcript directly into the focused text field
+/// (like phone-keyboard dictation): each streaming update appends its
+/// suffix at the caret via the existing transactional paste, and the
+/// release path replaces the whole inserted span with the final processed
+/// text through an AX selected-range set. Abandon paths delete the span.
+/// Tracks the span in UTF-16 units — the currency of AX text ranges.
+@MainActor
+final class LiveTextInjector {
+    private(set) var isActive = false
+    /// True once the field can no longer be updated incrementally (caret
+    /// moved, element changed, text rewritten mid-flight); finalize still
+    /// tries the one-shot span replacement.
+    private(set) var diverged = false
+    private var element: AXUIElement?
+    private var spanLocation: Int?
+    private var insertedUTF16Length = 0
+    private var insertedText = ""
+
+    static let backspaceKeyCode: CGKeyCode = 0x33
+
+    /// Appends the update's new suffix into the field. First call pastes
+    /// the whole text and records the span. Pure growth appends the delta;
+    /// when the hypothesis rewrites earlier words (mid-stream decoder state
+    /// resets do that after speech pauses), only the changed TAIL of the
+    /// span is re-selected and re-pasted — the head of the draft stays
+    /// untouched, so corrections read as local word fixes, not whole-text
+    /// jumps.
+    func apply(updateText: String) async {
+        guard !updateText.isEmpty else { return }
+        if !isActive {
+            begin(with: updateText)
+            return
+        }
+        guard !diverged else { return }
+        guard await normalizeSelectionForAppend() else {
+            diverged = true
+            log("live typing: caret moved away from inserted text; holding until finalize")
+            return
+        }
+        let commonUnits = utf16CommonPrefixLength(insertedText, updateText)
+        let insertedUnits = insertedUTF16Length
+        let updatedUnits = updateText.utf16.count
+        if commonUnits == insertedUnits, updatedUnits > commonUnits {
+            // Pure growth: paste the suffix at the collapsed caret.
+            let delta = String(decoding: Array(updateText.utf16)[commonUnits...], as: UTF16.self)
+            guard TextInserter.insert(delta) else {
+                diverged = true
+                log("live typing: delta paste failed; holding until finalize")
+                return
+            }
+            insertedText = updateText
+            insertedUTF16Length = updatedUnits
+            return
+        }
+        // Rewrite from the divergence point: select [common, end) of the
+        // span — verified to have landed before pasting, since an
+        // unapplied selection pastes at the old caret and leaves residue.
+        guard let spanLocation else {
+            diverged = true
+            return
+        }
+        guard await selectSpanRangeVerified(location: spanLocation + commonUnits,
+                                            length: insertedUnits - commonUnits) else {
+            diverged = true
+            log("live typing: tail selection did not stick; holding until finalize")
+            return
+        }
+        let tailUnits = Array(updateText.utf16)[commonUnits...]
+        let tailText = String(decoding: tailUnits, as: UTF16.self)
+        if !tailText.isEmpty || insertedUnits > commonUnits {
+            if tailText.isEmpty {
+                // The update shrank the text: delete the selected tail.
+                guard postBackspace() else {
+                    diverged = true
+                    return
+                }
+            } else {
+                guard TextInserter.insert(tailText) else {
+                    diverged = true
+                    log("live typing: tail rewrite paste failed; holding until finalize")
+                    return
+                }
+            }
+        }
+        insertedText = updateText
+        insertedUTF16Length = updatedUnits
+    }
+
+    /// Replaces the interim span with the final transcript. Returns true
+    /// when the injector owns in-field text — the caller must then skip its
+    /// normal insertion regardless of how well the replacement went
+    /// (a fallback plain insert would duplicate the interim text).
+    func finalize(with finalText: String) async -> Bool {
+        defer { isActive = false }
+        guard isActive else { return false }
+        if let spanLocation,
+           await selectSpanRangeVerified(location: spanLocation, length: insertedUTF16Length) {
+            if finalText.isEmpty {
+                _ = postBackspace()
+            } else {
+                _ = TextInserter.insert(finalText)
+            }
+            log("live typing: finalized span (\(insertedUTF16Length) UTF-16 units) → \(finalText.count) chars")
+            return true
+        }
+        // No span selection (unsupported app, stale element, or the async
+        // AX bridge never landed it): paste the missing suffix at the caret
+        // when the final text extends the interim one, otherwise leave the
+        // interim text in place — a plain full insert would duplicate it.
+        if !diverged, let delta = liveAppendDelta(from: insertedText, to: finalText),
+           await normalizeSelectionForAppend() {
+            _ = TextInserter.insert(delta)
+            log("live typing: finalized by appending \(delta.count) chars (span selection unavailable)")
+            return true
+        }
+        log("live typing: finalize degraded — interim text left in field")
+        return true
+    }
+
+    /// Deletes the interim span on abandon paths (escape, permission loss,
+    /// sleep, termination). Best effort: without a settable selection the
+    /// interim text stays and one undo removes it. Runs asynchronously —
+    /// the verified selection needs bounded retries — so callers don't wait.
+    func cancel() {
+        guard isActive else { return }
+        isActive = false
+        let spanLocation = spanLocation
+        let length = insertedUTF16Length
+        Task { @MainActor [weak self] in
+            guard let self,
+                  let spanLocation,
+                  length > 0,
+                  await self.selectSpanRangeVerified(location: spanLocation, length: length),
+                  self.postBackspace() else {
+                log("live typing: cancelled; interim text left in field (undo removes it)")
+                return
+            }
+            log("live typing: cancelled, interim text removed")
+        }
+    }
+
+    private func begin(with text: String) {
+        guard let target = Self.focusedEditableTextElement(),
+              let caret = Self.selectedTextRange(of: target) else {
+            log("live typing: no editable focused text field; waiting for finalize")
+            return
+        }
+        guard TextInserter.insert(text) else {
+            log("live typing: initial paste failed")
+            return
+        }
+        element = target
+        spanLocation = caret.location
+        insertedText = text
+        insertedUTF16Length = text.utf16.count
+        isActive = true
+        log("live typing: began at UTF-16 offset \(caret.location), \(insertedUTF16Length) units")
+    }
+
+    /// Sets the selected range and reads it back until the app actually
+    /// applied it. Chromium/Electron's AX bridge applies selection changes
+    /// asynchronously on its own run loop: pasting before the new selection
+    /// lands inserts at the OLD caret, leaving un-replaced residue that then
+    /// accumulates with every rewrite. A short bounded wait makes set+paste
+    /// effectively atomic; if the selection never sticks we refuse to touch
+    /// the field (the finalize replace still recovers it).
+    private func selectSpanRangeVerified(location: Int, length: Int) async -> Bool {
+        guard let element else { return false }
+        guard setSelectedRange(location: location, length: length, on: element) else { return false }
+        for _ in 0..<6 {
+            if let current = Self.selectedTextRange(of: element),
+               current.location == location,
+               current.length == length {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 25_000_000)
+        }
+        return false
+    }
+
+    /// True when the caret sits collapsed at the end of our span — the only
+    /// state where an append-paste is safe. Apps that keep the just-pasted
+    /// text SELECTED get that selection collapsed first (and the collapse
+    /// verified): an append-paste against a live selection would replace it
+    /// instead of extending.
+    private func normalizeSelectionForAppend() async -> Bool {
+        guard let element, let spanLocation else { return false }
+        guard let current = Self.selectedTextRange(of: element) else { return false }
+        let spanEnd = spanLocation + insertedUTF16Length
+        if current.length == 0, current.location == spanEnd {
+            return true
+        }
+        if current.location == spanLocation, current.length == insertedUTF16Length {
+            return await selectSpanRangeVerified(location: spanEnd, length: 0)
+        }
+        return false
+    }
+
+    private func setSelectedRange(location: Int, length: Int, on element: AXUIElement) -> Bool {
+        var range = CFRange(location: location, length: length)
+        guard let value = AXValueCreate(.cfRange, &range) else { return false }
+        return AXUIElementSetAttributeValue(element,
+                                            kAXSelectedTextRangeAttribute as CFString,
+                                            value) == .success
+    }
+
+    private func postBackspace() -> Bool {
+        let source = CGEventSource(stateID: .combinedSessionState)
+        let keyDown = CGEvent(keyboardEventSource: source, virtualKey: Self.backspaceKeyCode, keyDown: true)
+        let keyUp = CGEvent(keyboardEventSource: source, virtualKey: Self.backspaceKeyCode, keyDown: false)
+        guard let keyDown, let keyUp else { return false }
+        keyDown.post(tap: .cghidEventTap)
+        keyUp.post(tap: .cghidEventTap)
+        return true
+    }
+
+    private static func focusedEditableTextElement() -> AXUIElement? {
+        // The system-wide focused element is already the deepest focused
+        // node (the text area itself when editing).
+        let systemWide = AXUIElementCreateSystemWide()
+        var focusedRaw: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(systemWide,
+                                            kAXFocusedUIElementAttribute as CFString,
+                                            &focusedRaw) == .success,
+              let focused = focusedRaw else { return nil }
+        let element = unsafeBitCast(focused, to: AXUIElement.self)
+        var settable: DarwinBoolean = false
+        guard AXUIElementIsAttributeSettable(element,
+                                             kAXSelectedTextRangeAttribute as CFString,
+                                             &settable) == .success,
+              settable.boolValue else { return nil }
+        return element
+    }
+
+    private static func selectedTextRange(of element: AXUIElement) -> (location: Int, length: Int)? {
+        var raw: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element,
+                                            kAXSelectedTextRangeAttribute as CFString,
+                                            &raw) == .success,
+              let value = raw, CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
+        let axValue = unsafeDowncast(value, to: AXValue.self)
+        guard AXValueGetType(axValue) == .cfRange else { return nil }
+        var range = CFRange()
+        guard AXValueGetValue(axValue, .cfRange, &range) else { return nil }
+        return (range.location, range.length)
+    }
+}
+
 @MainActor
 final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private struct CachedInsertionTarget {
@@ -10521,6 +11072,12 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var staleRecordingLevelTicks = 0
     private var recordingHUDPanel: NSPanel?
     private var recordingHUDView: RecordingHUDView?
+    // Live (streaming) transcription: session, its update consumer, and
+    // the injector that types the growing transcript into the focused text
+    // field.
+    private var liveSession: SlidingWindowAsrManager?
+    private var liveUpdatesTask: Task<Void, Never>?
+    private var liveInjector: LiveTextInjector?
     private var recordingHUDTranscribingStartedAt: TimeInterval?
     private var recordingHUDAnimationToken = 0
     private var recordingHUDDisplayLink: CADisplayLink?
@@ -11151,6 +11708,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func prepareForStartupAttempt() {
         cancelMaxDurationAutoRelease()
+        cancelLiveTranscriptionInBackground()
+        cancelLiveInjector()
 
         if isRecording || audio.isRunning {
             let captured = audio.endRecording()
@@ -11372,6 +11931,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         cancelMaxDurationAutoRelease()
         stopRecordingLevelMeter()
         unmuteIfWeMuted()
+        cancelLiveTranscriptionInBackground()
+        cancelLiveInjector()
 
         isReady = false
         isCoreRuntimeReady = false
@@ -11467,6 +12028,154 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 recordStartupFailure(stage: .audioInput, error: error, reason: reason)
             }
         }
+    }
+
+    // macOS 14.x E5RT: the first CoreML inference after system sleep can
+    // time out because the Neural Engine is cold even though the compiled
+    // program stayed loaded. A cheap warm-up right after the audio runtime
+    // comes back lets the first real dictation of the session succeed
+    // instead of being dropped to the recovery journal.
+    private func schedulePostWakeNeuralEngineWarmUp() {
+        guard isSpeechModelReady, !isRecording, !isBusy, !isTerminating else { return }
+        Task { @MainActor [weak self] in
+            guard let self,
+                  self.isSpeechModelReady,
+                  !self.isRecording,
+                  !self.isBusy,
+                  !self.isTerminating else { return }
+            do {
+                _ = try await self.asr.warmUp()
+                log("ASR: post-wake warm-up completed")
+            } catch {
+                log("ASR: post-wake warm-up skipped: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    // MARK: - Live transcription
+
+    private func beginLiveTranscriptionIfNeeded() {
+        guard settings.liveDictationEnabled,
+              isSpeechModelReady,
+              !isTerminating else { return }
+        let worker = asr
+        Task { @MainActor in
+            guard self.isRecording, !self.isTerminating, self.liveSession == nil else { return }
+            do {
+                let session = try await worker.makeStreamingSession()
+                guard self.isRecording, !self.isTerminating else {
+                    await session.cancel()
+                    await worker.endStreamingSession()
+                    return
+                }
+                self.liveSession = session
+                self.liveInjector = LiveTextInjector()
+                self.audio.onConvertedBuffer = { [weak self, weak session] buffer in
+                    guard let self, let session else { return }
+                    self.streamToLiveSession(session, buffer: buffer)
+                }
+                self.observeLiveTranscriptionUpdates(session)
+                log("live transcription: session attached")
+            } catch {
+                log("live transcription unavailable (\(error.localizedDescription)); batch path will transcribe on release")
+            }
+        }
+    }
+
+    /// Transfers a freshly-converted tap buffer into the streaming actor.
+    /// AVAudioPCMBuffer isn't Sendable, so the hop carries only the sample
+    /// values ([Float]) plus the sample rate and rebuilds a buffer inside
+    /// the task — the copies are a few hundred floats per 20 ms tap.
+    nonisolated private func streamToLiveSession(_ session: SlidingWindowAsrManager,
+                                                 buffer: AVAudioPCMBuffer) {
+        guard let channel = buffer.floatChannelData?[0], buffer.frameLength > 0 else { return }
+        let samples = Array(UnsafeBufferPointer(start: channel, count: Int(buffer.frameLength)))
+        let sampleRate = buffer.format.sampleRate
+        Task {
+            guard let rebuilt = Self.rebuildMonoBuffer(samples: samples, sampleRate: sampleRate) else { return }
+            await session.streamAudio(rebuilt)
+        }
+    }
+
+    nonisolated private static func rebuildMonoBuffer(samples: [Float], sampleRate: Double) -> AVAudioPCMBuffer? {
+        guard let format = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                         sampleRate: sampleRate,
+                                         channels: 1,
+                                         interleaved: false),
+              let buffer = AVAudioPCMBuffer(pcmFormat: format,
+                                            frameCapacity: AVAudioFrameCount(samples.count)) else { return nil }
+        buffer.frameLength = AVAudioFrameCount(samples.count)
+        guard let destination = buffer.floatChannelData?[0] else { return nil }
+        samples.withUnsafeBufferPointer { source in
+            destination.update(from: source.baseAddress!, count: samples.count)
+        }
+        return buffer
+    }
+
+    private func observeLiveTranscriptionUpdates(_ session: SlidingWindowAsrManager) {
+        liveUpdatesTask?.cancel()
+        liveUpdatesTask = Task { @MainActor [weak self] in
+            // The updates property is actor-isolated; bind the stream once,
+            // then consume it without per-iteration hops.
+            let updates = await session.transcriptionUpdates
+            var awaitingFirstUpdate = true
+            for await _ in updates {
+                guard let self, self.isRecording, !Task.isCancelled else { break }
+                if awaitingFirstUpdate {
+                    awaitingFirstUpdate = false
+                    log("live transcription: first caption update")
+                }
+                // Both tiers are typed: confirmed grows append-only, the
+                // volatile tail gets corrected in place by the injector's
+                // divergence-point rewrite. Punctuation is stripped for the
+                // throwaway draft; the batch final restores it.
+                let confirmed = await session.confirmedTranscript
+                let volatile = await session.volatileTranscript
+                await self.liveInjector?.apply(updateText: interimTypingText(
+                    joinedLiveTranscript(confirmed: confirmed, volatile: volatile)
+                ))
+            }
+        }
+    }
+
+    /// Stops feeding the live session and detaches its state. Call before
+    /// draining the capture. The returned session is the caller's to finish
+    /// (release path) or cancel (abandon paths). The live injector is NOT
+    /// touched here: the release path still needs it to replace the interim
+    /// in-field text with the final transcript.
+    @discardableResult
+    private func detachLiveTranscription() -> SlidingWindowAsrManager? {
+        audio.onConvertedBuffer = nil
+        liveUpdatesTask?.cancel()
+        liveUpdatesTask = nil
+        defer { liveSession = nil }
+        return liveSession
+    }
+
+    private func cancelDetachedLiveTranscription(_ session: SlidingWindowAsrManager?) async {
+        guard let session else { return }
+        await session.cancel()
+        await asr.endStreamingSession()
+        log("live transcription: session cancelled")
+    }
+
+    /// Fire-and-forget variant for synchronous teardown contexts (startup
+    /// restarts, system sleep, termination).
+    private func cancelLiveTranscriptionInBackground() {
+        let session = detachLiveTranscription()
+        guard session != nil else { return }
+        Task { @MainActor [weak self] in
+            await self?.cancelDetachedLiveTranscription(session)
+        }
+    }
+
+    /// Removes interim in-field text on every abandon path (escape,
+    /// permission loss, sleep, termination, mid-recording opt-out). The
+    /// release path deliberately does not call this — it finalizes.
+    private func cancelLiveInjector() {
+        guard let injector = liveInjector else { return }
+        liveInjector = nil
+        injector.cancel()
     }
 
     // MARK: - Permission readiness
@@ -12454,6 +13163,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             updateSetupChecklist()
         }
         startRecordingLevelMeter(initialContext: initialInsertionContext)
+        beginLiveTranscriptionIfNeeded()
         if settings.playFeedbackSounds {
             Sounds.playStart()
         }
@@ -12491,6 +13201,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         cancelMaxDurationAutoRelease()
         unmuteIfWeMuted()
 
+        // Stop feeding the live session before draining the capture; its
+        // finish() provides the final text (with a batch fallback) inside
+        // the transcription task below.
+        let liveSessionForRelease = detachLiveTranscription()
+
         let audioFinalizeStartedAt = ProcessInfo.processInfo.systemUptime
         let captured = audio.endRecording()
         let audioFinalizedAt = ProcessInfo.processInfo.systemUptime
@@ -12518,16 +13233,64 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let asrRequestedAt = ProcessInfo.processInfo.systemUptime
         let transcriptionWorker = asr
         let language = settings.dictationLanguage.fluidLanguage
+        let liveSession = liveSessionForRelease
+        let hadLiveTyping = liveInjector?.isActive == true
+        let audioDuration = dur
         let transcriptionTask = Task.detached(priority: .userInitiated) {
-            let transcription = try await transcriptionWorker.transcribe(
-                samples: samples,
-                language: language,
-                requestedAt: asrRequestedAt
-            )
-            return CompletedTranscriptionWorkerResult(
-                transcription: transcription,
-                completedAt: ProcessInfo.processInfo.systemUptime
-            )
+            // Session close, then the batch path is the primary final — its
+            // 15 s chunks punctuate properly, the 1 s live chunks do not.
+            // When live text was already typed, finish() also yields an
+            // emergency fallback transcript for the rare total-batch
+            // failure. When nothing was typed (short dictation), finish()
+            // is pure latency — cancel instead and let the batch run at
+            // once.
+            var liveFallbackText: String?
+            if let session = liveSession {
+                if hadLiveTyping {
+                    do {
+                        let finishStartedAt = ProcessInfo.processInfo.systemUptime
+                        let text = try await session.finish()
+                        await transcriptionWorker.endStreamingSession()
+                        if liveTranscriptionResultIsUsable(text, audioDuration: audioDuration) {
+                            log("live transcription finished: \(text.count) chars in \(String(format: "%.2f", ProcessInfo.processInfo.systemUptime - finishStartedAt)) s (fallback only)")
+                            liveFallbackText = text
+                        }
+                    } catch {
+                        await transcriptionWorker.endStreamingSession()
+                        log("live transcription failed (\(error.localizedDescription)); batch only")
+                    }
+                } else {
+                    await session.cancel()
+                    await transcriptionWorker.endStreamingSession()
+                }
+            }
+            do {
+                let transcription = try await transcriptionWorker.transcribe(
+                    samples: samples,
+                    language: language,
+                    requestedAt: asrRequestedAt
+                )
+                return CompletedTranscriptionWorkerResult(
+                    transcription: transcription,
+                    completedAt: ProcessInfo.processInfo.systemUptime
+                )
+            } catch {
+                if let liveFallbackText {
+                    log("batch transcription failed; falling back to live transcript text")
+                    let completedAt = ProcessInfo.processInfo.systemUptime
+                    return CompletedTranscriptionWorkerResult(
+                        transcription: TranscriptionWorkerResult(
+                            text: liveFallbackText,
+                            workerQueueSeconds: 0,
+                            decoderPreparationSeconds: 0,
+                            fluidCallSeconds: 0,
+                            fluidProcessingSeconds: 0
+                        ),
+                        completedAt: completedAt
+                    )
+                }
+                throw error
+            }
         }
 
         let transcribingUIStartedAt = ProcessInfo.processInfo.systemUptime
@@ -12612,14 +13375,28 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         guard missing.isEmpty else {
                             isBusy = false
                             finishBusyHUD()
+                            cancelLiveInjector()
                             enterPermissionBlockedState(missing: missing, reason: "paste")
                             return
                         }
 
                         let insertionStartedAt = ProcessInfo.processInfo.systemUptime
-                        let inserted = TextInserter.insert(
-                            pastedText(from: finalText, suffix: settings.pasteSuffix)
-                        )
+                        // Live typing: if interim text already sits in the
+                        // field, the injector replaces that span with the
+                        // final transcript (and always reports ownership so
+                        // a plain insert can't duplicate it). An injector
+                        // that never typed anything (short dictation, no
+                        // confirmed text yet) must fall through to the
+                        // normal insert.
+                        let finalPastedText = pastedText(from: finalText, suffix: settings.pasteSuffix)
+                        let inserted: Bool
+                        if let injector = liveInjector, injector.isActive {
+                            liveInjector = nil
+                            inserted = await injector.finalize(with: finalPastedText)
+                        } else {
+                            liveInjector = nil
+                            inserted = TextInserter.insert(finalPastedText)
+                        }
                         let insertionCompletedAt = ProcessInfo.processInfo.systemUptime
                         var enterDelaySeconds: Double?
                         if inserted {
@@ -12669,11 +13446,24 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             pasteSucceeded: inserted
                         ).logLine)
                     } else {
+                        // Silence: nothing to finalize into — withdraw any
+                        // interim in-field text.
+                        cancelLiveInjector()
                         PendingDictationRecovery.remove(captured.recoveryURL)
                     }
                 }
+            } catch is TranscriptionWatchdogTimeout {
+                transcriptionTask.cancel()
+                log("transcription watchdog fired after \(String(format: "%.1f", transcriptionWatchdogSeconds(audioDuration: dur))) s (\(String(format: "%.1f", dur)) s audio); forcing engine recovery")
+                await transcriptionWorker.recoverAfterHungTranscription()
+                cancelLiveInjector()
+                dictationFailed = true
             } catch {
                 log("transcribe failed: \(error)")
+                // Total failure: the interim text is unreliable — withdraw
+                // it; the journal preserves the audio for next-launch
+                // recovery, matching the pre-live behavior.
+                cancelLiveInjector()
                 dictationFailed = true
             }
             isBusy = false
@@ -12702,6 +13492,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
 
         cancelMaxDurationAutoRelease()
+        let liveSessionToCancel = detachLiveTranscription()
+        cancelLiveInjector()
         let captured = audio.endRecording()
         let duration = Double(captured.samples.count) / SAMPLE_RATE
         isRecording = false
@@ -12728,6 +13520,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         Task { @MainActor in
             var recoveryFailed = false
             do {
+                await cancelDetachedLiveTranscription(liveSessionToCancel)
                 let requestedAt = ProcessInfo.processInfo.systemUptime
                 let transcription = try await asr.transcribe(
                     samples: captured.samples,
@@ -12794,6 +13587,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // recovery journal. The next launch transcribes it into history.
     private func cancelRecordingForTermination() {
         cancelMaxDurationAutoRelease()
+        cancelLiveTranscriptionInBackground()
+        cancelLiveInjector()
         hotkey.onPress = nil
         hotkey.onRelease = nil
         hotkey.onReleaseAlternate = nil
@@ -14672,6 +15467,14 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         waveform.state = settings.showRecordingWaveform ? .on : .off
         sub.addItem(waveform)
 
+        let liveDictation = NSMenuItem(title: "Live typing into the text field",
+                                       action: #selector(toggleLiveDictation(_:)),
+                                       keyEquivalent: "")
+        liveDictation.target = self
+        liveDictation.state = settings.liveDictationEnabled ? .on : .off
+        liveDictation.toolTip = "Types the growing transcript straight into the focused field while speaking; the final cleaned text replaces it on release."
+        sub.addItem(liveDictation)
+
         let mute = NSMenuItem(title: "Mute system audio while recording",
                               action: #selector(toggleMute(_:)),
                               keyEquivalent: "")
@@ -16111,6 +16914,22 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             showRecordingHUD(mode: .recording, level: recordingVisualLevel)
         } else {
             hideRecordingHUD()
+        }
+    }
+
+    @objc private func toggleLiveDictation(_ sender: NSMenuItem) {
+        settings.liveDictationEnabled.toggle()
+        sender.state = settings.liveDictationEnabled ? .on : .off
+        if !settings.liveDictationEnabled, isRecording {
+            // Mid-recording opt-out: stop live typing (removing the interim
+            // in-field text) and abandon the session; release falls back to
+            // the batch path.
+            let session = detachLiveTranscription()
+            cancelLiveInjector()
+            guard session != nil else { return }
+            Task { @MainActor in
+                await self.cancelDetachedLiveTranscription(session)
+            }
         }
     }
 
