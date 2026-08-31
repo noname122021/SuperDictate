@@ -4,3 +4,6 @@ swift/.build/
 dist/
 *.xcuserstate
 
+
+# Local agent workspace state
+.zcode/
